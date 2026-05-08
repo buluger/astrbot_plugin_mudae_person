@@ -1,0 +1,37 @@
+{
+    "super_admins": {
+      "description": "超级管理员QQ号列表",
+      "type": "list",
+      "hint": "超管QQ号列表，可执行刷新和终极轮回等专用命令",
+      "obvious_hint": true,
+      "default": []
+    },
+    "draw_hourly_limit": {
+      "description": "默认每小时抽卡次数",
+      "type": "int",
+      "hint": "建议不要太高",
+      "obvious_hint": true,
+      "default": 5
+    },
+    "claim_cooldown": {
+      "description": "默认结婚冷却时间(秒)",
+      "type": "int",
+      "hint": "冷却时间内无法收集角色",
+      "obvious_hint": true,
+      "default": 3600
+    },
+    "harem_max_size": {
+      "description": "默认后宫人数上限",
+      "type": "int",
+      "hint": "到达后会无法收集更多角色",
+      "obvious_hint": true,
+      "default": 20
+    },
+    "custom_images_limit": {
+      "description": "每个角色自定义图片数量上限",
+      "type": "int",
+      "hint": "超过后会无法添加自定义图片",
+      "obvious_hint": true,
+      "default": 5
+    }
+}
