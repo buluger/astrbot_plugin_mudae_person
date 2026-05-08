@@ -6,6 +6,13 @@
 
 NapCat 与 AstrBot 请参考 [https://docs.astrbot.app/deploy/platform/aiocqhttp/napcat.html](https://docs.astrbot.app/deploy/platform/aiocqhttp/napcat.html)
 
+**与同机「原版二次元卡池」插件并存**
+
+- **KV**：除 `{群号}:user_list`（群成员活跃列表，两插件共用，便于换人等功能判断「是否在本群」）外，本分支的**群配置、老婆团、结缘关系、许愿、抽人配额、待结缘消息、换老婆、查人冷却、老婆榜、自定义图路径**等均带前缀段 `mudae_real`，与原版数据完全隔离。
+- **磁盘**：自定义照片保存在 `plugin_data/astrbot_plugin_mudae_person/`，与原版 `astrbot_plugin_mudae_qq` 目录分离。
+- **指令**：请避免在两个插件里使用**完全相同**的主指令与别名（例如两边都注册 `cr`），否则 AstrBot 可能随机命中其中一个；本分支已使用「抽人 / cr」等独立命名时，与原版「抽卡 / ck」可并存。
+- **升级说明**：若你此前已在本分支旧版本里玩过，升级后老婆等数据会落在新的 KV 键下，旧键数据不会自动迁移，相当于该分支在群内「新开一档」。
+
 ## 参数设置
 
 在「插件 → 插件配置」中编辑默认参数（如每周期抽人次数、结缘冷却、老婆名额上限等）。群内可用 **`抽人设置`** 覆盖本群配置。

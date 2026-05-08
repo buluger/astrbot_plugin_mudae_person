@@ -14,6 +14,21 @@ import asyncio
 DRAW_MSG_TTL = 45  # seconds to keep draw message records
 DRAW_MSG_INDEX_MAX = 300  # max tracked message ids to avoid unbounded growth
 
+# 与原版 mudae 插件（二次元卡池）同机并存：除 `{gid}:user_list`（群活跃成员，两插件共用）外，
+# 所有玩法 KV 均带此前缀，避免老婆团/许愿/配置/自定义图路径等与原版串台。
+MUDAE_SESSION_KV_SCOPE = "mudae_real"
+# 与 metadata.yaml 的 name 一致，避免与原版 `astrbot_plugin_mudae_qq` 共用同一数据目录
+PLUGIN_DATA_DIR_NAME = "astrbot_plugin_mudae_person"
+
+
+def _session_kv(gid: str, *parts) -> str:
+    return ":".join([str(gid), MUDAE_SESSION_KV_SCOPE, *[str(p) for p in parts]])
+
+
+def _harem_heats_key(gid: str) -> str:
+    return f"{gid}_harem_heats_{MUDAE_SESSION_KV_SCOPE}"
+
+
 class CCB_Plugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -31,7 +46,9 @@ class CCB_Plugin(Star):
         self.group_cfgs = {}
         self.user_lists = {}
         self.group_locks = {}
-        self.plugin_data_path = f"{get_astrbot_data_path()}/plugin_data/astrbot_plugin_mudae_qq"
+        self.plugin_data_path = (
+            f"{get_astrbot_data_path()}/plugin_data/{PLUGIN_DATA_DIR_NAME}"
+        )
 
     async def initialize(self):
         """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
@@ -46,13 +63,13 @@ class CCB_Plugin(Star):
 
     async def get_group_cfg(self, gid):
         if gid not in self.group_cfgs:
-            config = await self.get_kv_data(f"{gid}:config", {}) or {}
+            config = await self.get_kv_data(_session_kv(gid, "config"), {}) or {}
             self.group_cfgs[gid] = config
         return self.group_cfgs[gid]
 
     async def put_group_cfg(self, gid, config):
         self.group_cfgs[gid] = config
-        await self.put_kv_data(f"{gid}:config", config)
+        await self.put_kv_data(_session_kv(gid, "config"), config)
 
     async def get_user_list(self, gid):
         if gid not in self.user_lists:
@@ -126,10 +143,13 @@ class CCB_Plugin(Star):
             and getattr(event.message_obj.raw_message, "post_type", None) == "notice"
             and getattr(event.message_obj.raw_message, "notice_type", None) == "group_msg_emoji_like"
         ):
-            # stop further pipeline (including default LLM) for notice events
+            # 仅在本插件确实回复了用户时才结束后续管线；否则交给同机其他插件（如原版 mudae）处理同一表情事件
+            emoji_got_reply = False
             async for result in self.handle_emoji_like_notice(event):
+                emoji_got_reply = True
                 yield result
-            return
+            if emoji_got_reply:
+                return
 
     async def handle_emoji_like_notice(self, event: AstrMessageEvent):
         '''用户回应抽人结果与换老婆请求的处理器'''
@@ -138,20 +158,20 @@ class CCB_Plugin(Star):
         now_ts = time.time()
         gid = event.get_group_id() or "global"
         
-        draw_msg = await self.get_kv_data(f"{gid}:draw_msg:{msg_id}", None)
+        draw_msg = await self.get_kv_data(_session_kv(gid, "draw_msg", msg_id), None)
         if draw_msg:
             event.call_llm = True
             async for res in self.handle_claim(event):
                 yield res
             return
-        exchange_req = await self.get_kv_data(f"{gid}:exchange_req:{msg_id}", None)
+        exchange_req = await self.get_kv_data(_session_kv(gid, "exchange_req", msg_id), None)
         if exchange_req:
             event.call_llm = True
             if str(emoji_user) != str(exchange_req.get("to_uid")):
                 return
-            await self.delete_kv_data(f"{gid}:exchange_req:{msg_id}")
+            await self.delete_kv_data(_session_kv(gid, "exchange_req", msg_id))
             ts = float(exchange_req.get("ts", 0) or 0)
-            idx_key = f"{gid}:exchange_req_index"
+            idx_key = _session_kv(gid, "exchange_req_index")
             idx = await self.get_kv_data(idx_key, [])
             new_idx = [item for item in idx if not (isinstance(item, dict) and item.get("id") == msg_id)]
             if len(new_idx) != len(idx):
@@ -208,7 +228,7 @@ class CCB_Plugin(Star):
         gid = event.get_group_id() or "global"
         lock = self._get_group_lock(gid)
         async with lock:
-            key = f"{gid}:{user_id}:draw_status"
+            key = _session_kv(gid, user_id, "draw_status")
             now_ts = time.time()
             config = await self.get_group_cfg(gid)
             limit = config.get("draw_hourly_limit", self.draw_hourly_limit_default)
@@ -229,7 +249,7 @@ class CCB_Plugin(Star):
 
             cooldown = max(cooldown, 2)
             if cooldown > 0:
-                last_draw_ts = await self.get_kv_data(f"{gid}:last_draw", 0)
+                last_draw_ts = await self.get_kv_data(_session_kv(gid, "last_draw"), 0)
                 if (now_ts - last_draw_ts) < cooldown:
                     return
 
@@ -249,7 +269,7 @@ class CCB_Plugin(Star):
 
             next_count = count + 1
             remaining = limit - next_count
-            wish_list = await self.get_kv_data(f"{gid}:{user_id}:wish_list", [])
+            wish_list = await self.get_kv_data(_session_kv(gid, user_id, "wish_list"), [])
             if random.random() < 0.003 and wish_list:
                 char_id = random.choice(wish_list)
                 character = self.char_manager.get_character_by_id(char_id)
@@ -261,16 +281,16 @@ class CCB_Plugin(Star):
             name = character.get("name", "未知人物")
             char_id = character.get("id")
             images = character.get("image") or []
-            custom_paths = await self.get_kv_data(f"{gid}:{char_id}:custom_images", []) if char_id is not None else []
+            custom_paths = await self.get_kv_data(_session_kv(gid, char_id, "custom_images"), []) if char_id is not None else []
             custom_paths = [os.path.join(self.plugin_data_path, p) for p in custom_paths]
             pool = images + custom_paths
             image_url = random.choice(pool) if pool else None
             married_to = None
             if char_id is not None:
-                claimed_by = await self.get_kv_data(f"{gid}:{char_id}:married_to", None)
+                claimed_by = await self.get_kv_data(_session_kv(gid, char_id, "married_to"), None)
                 if claimed_by:
                     married_to = claimed_by
-            wished_by_key = f"{gid}:{char_id}:wished_by"
+            wished_by_key = _session_kv(gid, char_id, "wished_by")
             wished_by = await self.get_kv_data(wished_by_key, [])
             
             cq_message = []
@@ -302,10 +322,10 @@ class CCB_Plugin(Star):
                 resp = await event.bot.api.call_action("send_group_msg", group_id=event.get_group_id(), message=cq_message)
                 msg_id = resp.get("message_id") if isinstance(resp, dict) else None
                 await self.put_kv_data(key, (bucket_id, next_count))
-                await self.put_kv_data(f"{gid}:last_draw", now_ts)
+                await self.put_kv_data(_session_kv(gid, "last_draw"), now_ts)
                 if msg_id is not None and (allow_ntr or not married_to):
                     # Maintain a small index; delete expired records
-                    idx = await self.get_kv_data(f"{gid}:draw_msg_index", [])
+                    idx = await self.get_kv_data(_session_kv(gid, "draw_msg_index"), [])
                     cutoff = now_ts - DRAW_MSG_TTL
                     new_idx = []
                     if isinstance(idx, list):
@@ -315,16 +335,16 @@ class CCB_Plugin(Star):
                             ts_old = item.get("ts", 0)
                             mid_old = item.get("id")
                             if ts_old and ts_old < cutoff and mid_old:
-                                await self.delete_kv_data(f"{gid}:draw_msg:{mid_old}")
+                                await self.delete_kv_data(_session_kv(gid, "draw_msg", mid_old))
                                 continue
                             new_idx.append(item)
                         idx = new_idx[-(DRAW_MSG_INDEX_MAX - 1) :] if len(new_idx) >= DRAW_MSG_INDEX_MAX else new_idx
                     else:
                         idx = []
                     idx.append({"id": msg_id, "ts": now_ts})
-                    await self.put_kv_data(f"{gid}:draw_msg_index", idx)
+                    await self.put_kv_data(_session_kv(gid, "draw_msg_index"), idx)
                     await self.put_kv_data(
-                        f"{gid}:draw_msg:{msg_id}",
+                        _session_kv(gid, "draw_msg", msg_id),
                         {
                             "char_id": str(char_id),
                             "ts": now_ts,
@@ -352,8 +372,8 @@ class CCB_Plugin(Star):
         now_ts = time.time()
         lock = self._get_group_lock(gid)
         async with lock:
-            draw_msg = await self.get_kv_data(f"{gid}:draw_msg:{msg_id}", None)
-            await self.delete_kv_data(f"{gid}:draw_msg:{msg_id}")
+            draw_msg = await self.get_kv_data(_session_kv(gid, "draw_msg", msg_id), None)
+            await self.delete_kv_data(_session_kv(gid, "draw_msg", msg_id))
             if not draw_msg:
                 return
             ts = draw_msg.get("ts", 0)
@@ -363,14 +383,14 @@ class CCB_Plugin(Star):
             char = self.char_manager.get_character_by_id(char_id)
             if not char:
                 return
-            claimed_by = await self.get_kv_data(f"{gid}:{char_id}:married_to", None)
+            claimed_by = await self.get_kv_data(_session_kv(gid, char_id, "married_to"), None)
             if claimed_by == user_id:
                 yield event.chain_result([
                     Comp.At(qq=user_id),
                     Comp.Plain(f"\u200b\n{char.get('name')} 保卫成功！")
                 ])
                 return
-            last_claim_ts = await self.get_kv_data(f"{gid}:{user_id}:last_claim", 0)
+            last_claim_ts = await self.get_kv_data(_session_kv(gid, user_id, "last_claim"), 0)
             if (now_ts - last_claim_ts) < cooldown:
                 wait_sec = int(cooldown - (now_ts - last_claim_ts))
                 wait_min = max(1, (wait_sec + 59) // 60)
@@ -378,11 +398,11 @@ class CCB_Plugin(Star):
                     Comp.At(qq=str(user_id)),
                     Comp.Plain(f"结缘冷却中，剩余{wait_min}分钟。")
                 ])
-                await self.put_kv_data(f"{gid}:draw_msg:{msg_id}", draw_msg)
+                await self.put_kv_data(_session_kv(gid, "draw_msg", msg_id), draw_msg)
                 return
-            
+
             # Claim path (NTR or normal): size check first
-            marry_list_key = f"{gid}:{user_id}:partners"
+            marry_list_key = _session_kv(gid, user_id, "partners")
             marry_list = await self.get_kv_data(marry_list_key, [])
             harem_max = config.get("harem_max_size", self.harem_max_size_default)
             if len(marry_list) >= harem_max:
@@ -390,11 +410,11 @@ class CCB_Plugin(Star):
                     Comp.At(qq=user_id),
                     Comp.Plain(f" 你的老婆名额已满（{harem_max}），无法再结缘。")
                 ])
-                await self.put_kv_data(f"{gid}:draw_msg:{msg_id}", draw_msg)
+                await self.put_kv_data(_session_kv(gid, "draw_msg", msg_id), draw_msg)
                 return
 
             if claimed_by:
-                prev_fav = await self.get_kv_data(f"{gid}:{claimed_by}:fav", None)
+                prev_fav = await self.get_kv_data(_session_kv(gid, claimed_by, "fav"), None)
                 if prev_fav is not None and str(prev_fav) == str(char_id):
                     if random.random() < 0.7:
                         yield event.chain_result([
@@ -403,19 +423,19 @@ class CCB_Plugin(Star):
                         ])
                         return
                     else:
-                        await self.delete_kv_data(f"{gid}:{claimed_by}:fav")
+                        await self.delete_kv_data(_session_kv(gid, claimed_by, "fav"))
                 # NTR: Delete old relationship, create new (marry_list already fetched and size-checked)
-                prev_marry_key = f"{gid}:{claimed_by}:partners"
+                prev_marry_key = _session_kv(gid, claimed_by, "partners")
                 prev_marry_list = await self.get_kv_data(prev_marry_key, [])
                 prev_marry_list = [m for m in prev_marry_list if m != str(char_id)]
                 await self.put_kv_data(prev_marry_key, prev_marry_list)
-                await self.delete_kv_data(f"{gid}:{char_id}:married_to")
+                await self.delete_kv_data(_session_kv(gid, char_id, "married_to"))
                 # Create new relationship
                 if str(char_id) not in marry_list:
                     marry_list.append(str(char_id))
                 await self.put_kv_data(marry_list_key, marry_list)
-                await self.put_kv_data(f"{gid}:{char_id}:married_to", user_id)
-                await self.put_kv_data(f"{gid}:{user_id}:last_claim", now_ts)
+                await self.put_kv_data(_session_kv(gid, char_id, "married_to"), user_id)
+                await self.put_kv_data(_session_kv(gid, user_id, "last_claim"), now_ts)
                 gender = char.get("gender")
                 if gender == "女":
                     title = "老婆"
@@ -434,8 +454,8 @@ class CCB_Plugin(Star):
                 if str(char_id) not in marry_list:
                     marry_list.append(str(char_id))
                 await self.put_kv_data(marry_list_key, marry_list)
-                await self.put_kv_data(f"{gid}:{char_id}:married_to", user_id)
-                await self.put_kv_data(f"{gid}:{user_id}:last_claim", now_ts)
+                await self.put_kv_data(_session_kv(gid, char_id, "married_to"), user_id)
+                await self.put_kv_data(_session_kv(gid, user_id, "last_claim"), now_ts)
                 gender = char.get("gender")
                 if gender == "女":
                     title = "老婆"
@@ -463,7 +483,7 @@ class CCB_Plugin(Star):
         if not replied_msg_id:
             return
         gid = event.get_group_id() or "global"
-        draw_msg = await self.get_kv_data(f"{gid}:draw_msg:{replied_msg_id}", None)
+        draw_msg = await self.get_kv_data(_session_kv(gid, "draw_msg", replied_msg_id), None)
         if not draw_msg:
             return
         async for res in self.handle_claim(event, msg_id=replied_msg_id):
@@ -478,7 +498,7 @@ class CCB_Plugin(Star):
         uid = str(event.get_sender_id())
         lock = self._get_group_lock(gid)
         async with lock:
-            marry_list_key = f"{gid}:{uid}:partners"
+            marry_list_key = _session_kv(gid, uid, "partners")
             marry_list = await self.get_kv_data(marry_list_key, [])
             if not marry_list:
                 yield event.chain_result([
@@ -486,7 +506,7 @@ class CCB_Plugin(Star):
                     Comp.At(qq=uid),
                     Comp.Plain("，你的老婆列表空空如也。")
                 ])
-                harem_heats_key = f"{gid}_harem_heats"
+                harem_heats_key = _harem_heats_key(gid)
                 harem_heats = await self.get_kv_data(harem_heats_key, {}) or {}
                 if uid in harem_heats:
                     del harem_heats[uid]
@@ -494,7 +514,7 @@ class CCB_Plugin(Star):
                 return
             lines = []
             per_page = 10
-            fav = await self.get_kv_data(f"{gid}:{uid}:fav", None)
+            fav = await self.get_kv_data(_session_kv(gid, uid, "fav"), None)
             bond_status_list = self.char_manager.get_bond_collection_status(marry_list)
             char_bond_ratio = {}
             for name, owned, total, ratio, owned_cids in bond_status_list:
@@ -507,7 +527,7 @@ class CCB_Plugin(Star):
                 if char is None:
                     continue
                 base_heat = float(char.get("heat") or 0)
-                wished_by = await self.get_kv_data(f"{gid}:{cid}:wished_by", [])
+                wished_by = await self.get_kv_data(_session_kv(gid, cid, "wished_by"), [])
                 num_wishers = len(wished_by)
                 bond_ratio = char_bond_ratio.get(int(cid), 1.0)
                 effective_heat = base_heat * (1.1 ** num_wishers) * bond_ratio
@@ -521,7 +541,7 @@ class CCB_Plugin(Star):
                     pct_increase = (effective_heat - base_heat) / base_heat * 100
                     line += f" (+{pct_increase:.1f}%)"
                 entries.append(line)
-            harem_heats_key = f"{gid}_harem_heats"
+            harem_heats_key = _harem_heats_key(gid)
             harem_heats = await self.get_kv_data(harem_heats_key, {}) or {}
             harem_heats[uid] = total_heat
             await self.put_kv_data(harem_heats_key, harem_heats)
@@ -603,7 +623,7 @@ class CCB_Plugin(Star):
         cid = int(str(cid).strip())
         lock = self._get_group_lock(gid)
         async with lock:
-            marry_list_key = f"{gid}:{user_id}:partners"
+            marry_list_key = _session_kv(gid, user_id, "partners")
             marry_list = await self.get_kv_data(marry_list_key, [])
             cmd_msg_id = event.message_obj.message_id
             if str(cid) not in marry_list:
@@ -613,15 +633,15 @@ class CCB_Plugin(Star):
                 ])
                 return
 
-            fav = await self.get_kv_data(f"{gid}:{user_id}:fav", None)
+            fav = await self.get_kv_data(_session_kv(gid, user_id, "fav"), None)
             if fav and str(fav) == str(cid):
-                await self.delete_kv_data(f"{gid}:{user_id}:fav")
+                await self.delete_kv_data(_session_kv(gid, user_id, "fav"))
             elif fav is not None and fav not in marry_list:
-                await self.delete_kv_data(f"{gid}:{user_id}:fav")
+                await self.delete_kv_data(_session_kv(gid, user_id, "fav"))
 
             marry_list = [m for m in marry_list if m != str(cid)]
             await self.put_kv_data(marry_list_key, marry_list)
-            await self.delete_kv_data(f"{gid}:{cid}:married_to")
+            await self.delete_kv_data(_session_kv(gid, cid, "married_to"))
             cname = self.char_manager.get_character_by_id(cid).get("name") or ""
             yield event.chain_result([
                 Comp.Reply(id=cmd_msg_id),
@@ -644,13 +664,13 @@ class CCB_Plugin(Star):
         other_cid = int(str(other_cid).strip())
 
         # Validate ownership via char_marry to avoid stale local list
-        my_claim_key = f"{gid}:{my_cid}:married_to"
+        my_claim_key = _session_kv(gid, my_cid, "married_to")
         my_uid = await self.get_kv_data(my_claim_key, None)
         if not my_uid or str(my_uid) != str(user_id):
             yield event.plain_result("你并未与该人物结缘，无法换老婆。")
             return
 
-        other_claim_key = f"{gid}:{other_cid}:married_to"
+        other_claim_key = _session_kv(gid, other_cid, "married_to")
         other_uid = await self.get_kv_data(other_claim_key, None)
         if not other_uid or str(other_uid) == str(user_id):
             yield event.plain_result("对方人物未结缘，无法换老婆。")
@@ -676,7 +696,7 @@ class CCB_Plugin(Star):
             msg_id = resp.get("message_id") if isinstance(resp, dict) else None
             if msg_id is not None:
                 now_ts = time.time()
-                idx_key = f"{gid}:exchange_req_index"
+                idx_key = _session_kv(gid, "exchange_req_index")
                 idx = await self.get_kv_data(idx_key, [])
                 cutoff = now_ts - DRAW_MSG_TTL
                 new_idx = []
@@ -687,7 +707,7 @@ class CCB_Plugin(Star):
                         ts_old = item.get("ts", 0)
                         mid_old = item.get("id")
                         if ts_old and ts_old < cutoff and mid_old:
-                            await self.delete_kv_data(f"{gid}:exchange_req:{mid_old}")
+                            await self.delete_kv_data(_session_kv(gid, "exchange_req", mid_old))
                             continue
                         new_idx.append(item)
                     idx = new_idx[-(DRAW_MSG_INDEX_MAX - 1) :] if len(new_idx) >= DRAW_MSG_INDEX_MAX else new_idx
@@ -696,7 +716,7 @@ class CCB_Plugin(Star):
                 idx.append({"id": msg_id, "ts": now_ts})
                 await self.put_kv_data(idx_key, idx)
                 await self.put_kv_data(
-                    f"{gid}:exchange_req:{msg_id}",
+                    _session_kv(gid, "exchange_req", msg_id),
                     {
                         "from_uid": str(user_id),
                         "to_uid": str(other_uid),
@@ -724,8 +744,8 @@ class CCB_Plugin(Star):
             if not (from_uid in user_set and to_uid in user_set):
                 return
 
-            from_claim_key = f"{gid}:{from_cid}:married_to"
-            to_claim_key = f"{gid}:{to_cid}:married_to"
+            from_claim_key = _session_kv(gid, from_cid, "married_to")
+            to_claim_key = _session_kv(gid, to_cid, "married_to")
             from_marrried_to = await self.get_kv_data(from_claim_key, None)
             to_marrried_to = await self.get_kv_data(to_claim_key, None)
 
@@ -737,15 +757,15 @@ class CCB_Plugin(Star):
                 yield event.plain_result("换老婆失败：你已不再拥有该人物。")
                 return
 
-            from_fav = await self.get_kv_data(f"{gid}:{from_uid}:fav", None)
-            to_fav = await self.get_kv_data(f"{gid}:{to_uid}:fav", None)
+            from_fav = await self.get_kv_data(_session_kv(gid, from_uid, "fav"), None)
+            to_fav = await self.get_kv_data(_session_kv(gid, to_uid, "fav"), None)
             if from_fav and str(from_fav) == from_cid:
-                await self.delete_kv_data(f"{gid}:{from_uid}:fav")
+                await self.delete_kv_data(_session_kv(gid, from_uid, "fav"))
             if to_fav and str(to_fav) == to_cid:
-                await self.delete_kv_data(f"{gid}:{to_uid}:fav")
+                await self.delete_kv_data(_session_kv(gid, to_uid, "fav"))
 
-            from_list_key = f"{gid}:{from_uid}:partners"
-            to_list_key = f"{gid}:{to_uid}:partners"
+            from_list_key = _session_kv(gid, from_uid, "partners")
+            to_list_key = _session_kv(gid, to_uid, "partners")
             from_list = await self.get_kv_data(from_list_key, [])
             to_list = await self.get_kv_data(to_list_key, [])
 
@@ -793,14 +813,14 @@ class CCB_Plugin(Star):
             yield event.plain_result("用法：置顶老婆 <人物ID>")
             return
         cid = str(cid).strip()
-        marry_list_key = f"{gid}:{user_id}:partners"
+        marry_list_key = _session_kv(gid, user_id, "partners")
         marry_list = await self.get_kv_data(marry_list_key, [])
         target = next((m for m in marry_list if str(m) == str(cid)), None)
         if not target:
             yield event.plain_result("你尚未与该人物结缘！")
             return
         cname = self.char_manager.get_character_by_id(cid).get("name") or ""
-        await self.put_kv_data(f"{gid}:{user_id}:fav", cid)
+        await self.put_kv_data(_session_kv(gid, user_id, "fav"), cid)
         msg_chain = [
             Comp.Plain("已将 "),
             Comp.Plain(cname or str(cid)),
@@ -827,7 +847,7 @@ class CCB_Plugin(Star):
         if not char:
             yield event.plain_result(f"未找到ID为 {cid} 的人物")
             return
-        wish_list_key = f"{gid}:{user_id}:wish_list"
+        wish_list_key = _session_kv(gid, user_id, "wish_list")
         wish_list = await self.get_kv_data(wish_list_key, [])
         if len(wish_list) >= config.get("harem_max_size", self.harem_max_size_default):
             yield event.chain_result([
@@ -838,7 +858,7 @@ class CCB_Plugin(Star):
         if cid not in wish_list:
             wish_list.append(cid)
             await self.put_kv_data(wish_list_key, wish_list)
-        wished_by_key = f"{gid}:{cid}:wished_by"
+        wished_by_key = _session_kv(gid, cid, "wished_by")
         wished_by = await self.get_kv_data(wished_by_key, [])
         if user_id not in wished_by:
             wished_by.append(user_id)
@@ -855,7 +875,7 @@ class CCB_Plugin(Star):
         event.call_llm = True
         gid = event.get_group_id() or "global"
         user_id = str(event.get_sender_id())
-        wish_list_key = f"{gid}:{user_id}:wish_list"
+        wish_list_key = _session_kv(gid, user_id, "wish_list")
         wish_list = await self.get_kv_data(wish_list_key, [])
         if not wish_list:
             yield event.chain_result([
@@ -866,7 +886,7 @@ class CCB_Plugin(Star):
             return
         lines = []
         for cid in wish_list:
-            married_to = await self.get_kv_data(f"{gid}:{cid}:married_to", None)
+            married_to = await self.get_kv_data(_session_kv(gid, cid, "married_to"), None)
             char = self.char_manager.get_character_by_id(cid)
             if char is None:
                 continue
@@ -893,11 +913,11 @@ class CCB_Plugin(Star):
             yield event.plain_result("用法：删除许愿人 <人物ID>")
             return
         cid = str(cid).strip()
-        wish_list_key = f"{gid}:{user_id}:wish_list"
+        wish_list_key = _session_kv(gid, user_id, "wish_list")
         wish_list = await self.get_kv_data(wish_list_key, [])
         wish_list = [x for x in wish_list if str(x) != cid]
         await self.put_kv_data(wish_list_key, wish_list)
-        wished_by_key = f"{gid}:{cid}:wished_by"
+        wished_by_key = _session_kv(gid, cid, "wished_by")
         wished_by = await self.get_kv_data(wished_by_key, [])
         wished_by = [uid for uid in wished_by if str(uid) != user_id]
         if wished_by:
@@ -917,11 +937,11 @@ class CCB_Plugin(Star):
         config = await self.get_group_cfg(gid)
         query_cooldown = config.get("query_cooldown", 0)
         if query_cooldown > 0:
-            last_query_ts = await self.get_kv_data(f"{gid}:last_query", 0)
+            last_query_ts = await self.get_kv_data(_session_kv(gid, "last_query"), 0)
             if (time.time() - last_query_ts) < query_cooldown:
                 yield event.plain_result(f"查人冷却中，请等待{round(query_cooldown-(time.time()-last_query_ts),1)}秒后重试")
                 return
-        await self.put_kv_data(f"{gid}:last_query", time.time())
+        await self.put_kv_data(_session_kv(gid, "last_query"), time.time())
         event.call_llm = True
         if cid is None:
             yield event.plain_result("用法：查人 <人物ID> [图片序号]")
@@ -956,7 +976,7 @@ class CCB_Plugin(Star):
         gid = event.get_group_id() or "global"
         char_id = char.get("id")
         images = char.get("image") or []
-        custom_paths = await self.get_kv_data(f"{gid}:{char_id}:custom_images", []) if char_id is not None else []
+        custom_paths = await self.get_kv_data(_session_kv(gid, char_id, "custom_images"), []) if char_id is not None else []
         custom_full = [os.path.join(self.plugin_data_path, p) for p in custom_paths]
         pool = images + custom_full
         image_url = None
@@ -968,8 +988,8 @@ class CCB_Plugin(Star):
                 if iid < 1 or iid > len(pool):
                     iid = random.randint(1, len(pool))
             image_url = pool[iid - 1]
-        married_to = await self.get_kv_data(f"{gid}:{char_id}:married_to", None)
-        wished_by = await self.get_kv_data(f"{gid}:{char_id}:wished_by", [])
+        married_to = await self.get_kv_data(_session_kv(gid, char_id, "married_to"), None)
+        wished_by = await self.get_kv_data(_session_kv(gid, char_id, "wished_by"), [])
         base_heat = float(heat) if heat is not None else 0
         effective_heat = base_heat * (1.1 ** len(wished_by))
         heat_int = int(round(effective_heat))
@@ -1035,7 +1055,7 @@ class CCB_Plugin(Star):
         cid = int(str(cid).strip())
         lock = self._get_group_lock(gid)
         async with lock:
-            partners_key = f"{gid}:{user_id}:partners"
+            partners_key = _session_kv(gid, user_id, "partners")
             partners = await self.get_kv_data(partners_key, [])
             if str(cid) not in partners:
                 yield event.plain_result("人物不在你的老婆列表中")
@@ -1054,7 +1074,7 @@ class CCB_Plugin(Star):
             if not images:
                 yield event.plain_result("图片在哪呢我请问了")
                 return
-            custom_images_key = f"{gid}:{cid}:custom_images"
+            custom_images_key = _session_kv(gid, cid, "custom_images")
             paths = await self.get_kv_data(custom_images_key, [])
             if len(paths) >= self.custom_images_limit_default:
                 yield event.plain_result(f"已经有{self.custom_images_limit_default}张了，别加了")
@@ -1068,7 +1088,7 @@ class CCB_Plugin(Star):
             async with aiohttp.ClientSession() as session:
                 for img in images:
                     short_name = img["file_name"][-15:]
-                    save_name = f"{gid}_{cid}_{short_name}"
+                    save_name = f"{gid}_{MUDAE_SESSION_KV_SCOPE}_{cid}_{short_name}"
                     save_path = os.path.join(img_dir, save_name)
                     try:
                         async with session.get(img["url"]) as resp:
@@ -1096,12 +1116,12 @@ class CCB_Plugin(Star):
             yield event.plain_result("用法：清照片 <人物ID>")
             return
         cid = int(str(cid).strip())
-        married_to = await self.get_kv_data(f"{gid}:{cid}:married_to", None)
+        married_to = await self.get_kv_data(_session_kv(gid, cid, "married_to"), None)
         group_role = await self.get_group_role(event)
         if str(married_to) != user_id and group_role not in ['admin', 'owner'] and str(event.get_sender_id()) not in self.super_admins:
             yield event.plain_result("无权限：结缘用户或群管理员可清除该人物自定义照片")
             return
-        custom_images_key = f"{gid}:{cid}:custom_images"
+        custom_images_key = _session_kv(gid, cid, "custom_images")
         paths = await self.get_kv_data(custom_images_key, [])
         if not paths:
             yield event.plain_result("没有自定义图片")
@@ -1132,19 +1152,19 @@ class CCB_Plugin(Star):
             yield event.plain_result("用法：强制解除 <人物ID>")
             return
         cid = int(str(cid).strip())
-        await self.delete_kv_data(f"{gid}:{cid}:married_to")
+        await self.delete_kv_data(_session_kv(gid, cid, "married_to"))
 
         # 遍历用户列表检查坏数据
         users = await self.get_kv_data(f"{gid}:user_list", [])
         for uid in users:
-            partners_key = f"{gid}:{uid}:partners"
+            partners_key = _session_kv(gid, uid, "partners")
             marry_list = await self.get_kv_data(partners_key, [])
             if str(cid) in marry_list:
                 marry_list = [m for m in marry_list if m != str(cid)]
                 await self.put_kv_data(partners_key, marry_list)
-                fav = await self.get_kv_data(f"{gid}:{uid}:fav", None)
+                fav = await self.get_kv_data(_session_kv(gid, uid, "fav"), None)
                 if fav and str(fav) == str(cid):
-                    await self.delete_kv_data(f"{gid}:{uid}:fav")
+                    await self.delete_kv_data(_session_kv(gid, uid, "fav"))
 
         cname = (self.char_manager.get_character_by_id(cid) or {}).get("name") or cid
         yield event.plain_result(f"{cname} 已被强制解除结缘。")
@@ -1165,24 +1185,24 @@ class CCB_Plugin(Star):
                 yield event.plain_result("用法：清理老婆 <QQ号>")
                 return
             uid = str(uid).strip()
-            fav = await self.get_kv_data(f"{gid}:{uid}:fav", None)
-            marry_list = await self.get_kv_data(f"{gid}:{uid}:partners", [])
+            fav = await self.get_kv_data(_session_kv(gid, uid, "fav"), None)
+            marry_list = await self.get_kv_data(_session_kv(gid, uid, "partners"), [])
             if not marry_list:
-                await self.delete_kv_data(f"{gid}:{uid}:fav")
-                await self.delete_kv_data(f"{gid}:{uid}:partners")
+                await self.delete_kv_data(_session_kv(gid, uid, "fav"))
+                await self.delete_kv_data(_session_kv(gid, uid, "partners"))
                 yield event.plain_result(f"{uid} 的老婆团为空")
                 return
             for cid in marry_list:
                 if str(cid) == str(fav):
                     continue
-                await self.delete_kv_data(f"{gid}:{cid}:married_to")
+                await self.delete_kv_data(_session_kv(gid, cid, "married_to"))
             if fav is None:
-                await self.delete_kv_data(f"{gid}:{uid}:partners")
+                await self.delete_kv_data(_session_kv(gid, uid, "partners"))
             elif fav not in marry_list:
-                await self.delete_kv_data(f"{gid}:{uid}:fav")
-                await self.delete_kv_data(f"{gid}:{uid}:partners")
+                await self.delete_kv_data(_session_kv(gid, uid, "fav"))
+                await self.delete_kv_data(_session_kv(gid, uid, "partners"))
             else:
-                await self.put_kv_data(f"{gid}:{uid}:partners", [fav])
+                await self.put_kv_data(_session_kv(gid, uid, "partners"), [fav])
             yield event.plain_result(f"已清理 {uid} 的老婆团")
 
     @filter.command("抽人设置")
@@ -1381,8 +1401,8 @@ class CCB_Plugin(Star):
             yield event.plain_result("用法：人刷新 <QQ号>")
             return
         gid = event.get_group_id() or "global"
-        await self.delete_kv_data(f"{gid}:{user_id}:draw_status")
-        await self.delete_kv_data(f"{gid}:{user_id}:last_claim")
+        await self.delete_kv_data(_session_kv(gid, user_id, "draw_status"))
+        await self.delete_kv_data(_session_kv(gid, user_id, "last_claim"))
         yield event.plain_result("抽人次数已重置，结缘冷却已清除")
 
     @filter.command("老婆排行")
@@ -1391,7 +1411,7 @@ class CCB_Plugin(Star):
         '''显示本群老婆团总人气排名'''
         event.call_llm = True
         gid = event.get_group_id() or "global"
-        harem_heats_key = f"{gid}_harem_heats"
+        harem_heats_key = _harem_heats_key(gid)
         harem_heats = await self.get_kv_data(harem_heats_key, {}) or {}
         if not harem_heats:
             yield event.plain_result("暂无老婆排行数据")
@@ -1423,26 +1443,26 @@ class CCB_Plugin(Star):
         lock = self._get_group_lock(gid)
         async with lock:
             users = await self.get_kv_data(f"{gid}:user_list", [])
-            harem_heats_key = f"{gid}_harem_heats"
+            harem_heats_key = _harem_heats_key(gid)
             await self.delete_kv_data(harem_heats_key)
             for uid in users:
-                fav = await self.get_kv_data(f"{gid}:{uid}:fav", None)
-                marry_list = await self.get_kv_data(f"{gid}:{uid}:partners", [])
+                fav = await self.get_kv_data(_session_kv(gid, uid, "fav"), None)
+                marry_list = await self.get_kv_data(_session_kv(gid, uid, "partners"), [])
                 if not marry_list:
-                    await self.delete_kv_data(f"{gid}:{uid}:fav")
-                    await self.delete_kv_data(f"{gid}:{uid}:partners")
+                    await self.delete_kv_data(_session_kv(gid, uid, "fav"))
+                    await self.delete_kv_data(_session_kv(gid, uid, "partners"))
                     continue
                 for cid in marry_list:
                     if str(cid) == str(fav):
                         continue
-                    await self.delete_kv_data(f"{gid}:{cid}:married_to")
+                    await self.delete_kv_data(_session_kv(gid, cid, "married_to"))
                 if fav is None:
-                    await self.delete_kv_data(f"{gid}:{uid}:partners")
+                    await self.delete_kv_data(_session_kv(gid, uid, "partners"))
                 elif fav not in marry_list:
-                    await self.delete_kv_data(f"{gid}:{uid}:fav")
-                    await self.delete_kv_data(f"{gid}:{uid}:partners")
+                    await self.delete_kv_data(_session_kv(gid, uid, "fav"))
+                    await self.delete_kv_data(_session_kv(gid, uid, "partners"))
                 else:
-                    await self.put_kv_data(f"{gid}:{uid}:partners", [fav])
+                    await self.put_kv_data(_session_kv(gid, uid, "partners"), [fav])
             yield event.plain_result("已清除本群结缘数据（置顶老婆已保留）")
 
     async def terminate(self):
