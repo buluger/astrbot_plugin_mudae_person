@@ -1,5 +1,15 @@
 [
   {
+    "id": 83530,
+    "name": "色切子",
+    "alias": "色切子",
+    "heat": 9999,
+    "gender": "男",
+    "image": [
+      "https://lain.bgm.tv/pic/crt/l/d6/4d/83530_prsn_zPub9.jpg"
+    ]
+  },
+  {
     "id": 1002208,
     "name": "雷火剑",
     "alias": "雷火剣",
