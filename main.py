@@ -21,6 +21,10 @@ class CCB_Plugin(Star):
         self.config = config
         self.super_admins = self.config.super_admins or []
         self.draw_hourly_limit_default = self.config.draw_hourly_limit or 5
+        self.draw_quota_period_default = int(
+            getattr(self.config, "draw_quota_period_minutes", None) or 60
+        )
+        self.draw_quota_period_default = max(1, min(1440, self.draw_quota_period_default))
         self.claim_cooldown_default = self.config.claim_cooldown or 3600
         self.harem_max_size_default = self.config.harem_max_size or 10
         self.custom_images_limit_default = self.config.custom_images_limit or 5
@@ -35,7 +39,7 @@ class CCB_Plugin(Star):
             os.makedirs(self.plugin_data_path, exist_ok=True)
         chars = self.char_manager.load_characters()
         if not chars:
-            raise RuntimeError("无法加载角色数据：characters.json 缺失或格式错误")
+            raise RuntimeError("无法加载人物数据：现实人物.json 缺失或格式错误")
         bonds = self.char_manager.load_bonds()
         if not bonds:
             raise RuntimeError("无法加载收藏数据：bonds.json 缺失或格式错误")
@@ -73,10 +77,36 @@ class CCB_Plugin(Star):
             self.group_locks[gid] = lock
         return lock
 
+    def _draw_time_allowed(self, local_tm: time.struct_time, config: dict) -> tuple[bool, str | None]:
+        """若配置了 draw_time_start_hour / draw_time_end_hour（0–23），仅在对应时段内允许抽人。"""
+        start_h = config.get("draw_time_start_hour")
+        end_h = config.get("draw_time_end_hour")
+        if start_h is None or end_h is None:
+            return True, None
+        try:
+            sh = int(start_h) % 24
+            eh = int(end_h) % 24
+        except (TypeError, ValueError):
+            return True, None
+        if sh == eh:
+            return True, None
+        h = local_tm.tm_hour
+        if sh < eh:
+            ok = sh <= h < eh
+        else:
+            ok = h >= sh or h < eh
+        if ok:
+            return True, None
+        if sh < eh:
+            hint = f"{sh}:00–{eh}:00"
+        else:
+            hint = f"{sh}:00–次日{eh}:00"
+        return False, f"⚠当前不在允许抽人时段（{hint}）⚠"
+
     @filter.platform_adapter_type(PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def handle_group_notice(self, event: AstrMessageEvent):
-        '''用户回应抽卡结果和交换请求的处理器'''
+        '''用户回应抽人结果与换老婆请求的处理器'''
         gid = event.get_group_id()
         if not gid:
             return  # commands are group-only
@@ -102,7 +132,7 @@ class CCB_Plugin(Star):
             return
 
     async def handle_emoji_like_notice(self, event: AstrMessageEvent):
-        '''用户回应抽卡结果和交换请求的处理器'''
+        '''用户回应抽人结果与换老婆请求的处理器'''
         emoji_user = event.get_sender_id()
         msg_id = event.message_obj.raw_message.message_id
         now_ts = time.time()
@@ -132,47 +162,47 @@ class CCB_Plugin(Star):
                 yield res
             return
 
-    @filter.command("菜单", alias={"帮助"})
+    @filter.command("抽人菜单", alias={"抽人帮助"})
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def handle_help_menu(self, event: AstrMessageEvent):
-        '''显示帮助菜单'''
+        '''显示帮助菜单（现实人物专属指令，与常见「抽卡」类指令区分）'''
         event.call_llm = True
         menu_lines = [
-            "普通指令：",
-            "菜单/帮助",
-            "抽卡/ck",
-            "结婚（必须回复抽卡结果）",
-            "离婚 <角色ID>",
-            "最爱 <角色ID>",
-            "查询 <角色ID> [图片序号]",
-            "搜索 <角色名称>",
-            "我的后宫",
-            "我的后宫 <页码>",
-            "群排行",
-            "添加图片 <角色ID>",
-            "清除图片 <角色ID>",
-            "交换 <我的角色ID> <对方角色ID>",
-            "许愿 <角色ID>",
-            "愿望单",
-            "删除许愿 <角色ID>",
+            "【现实人物】普通指令：",
+            "抽人菜单 / 抽人帮助",
+            "抽人 / cr",
+            "结缘（回复抽人结果或贴表情）",
+            "解除婚姻关系 <人物ID>",
+            "置顶老婆 <人物ID>",
+            "查人 <人物ID> [图片序号]",
+            "搜人 <名称>",
+            "我的老婆",
+            "我的老婆 <页码>",
+            "老婆排行",
+            "加照片 <人物ID>",
+            "清照片 <人物ID>",
+            "换老婆 <我的人物ID> <对方人物ID>",
+            "许愿人 <人物ID>",
+            "愿望单人",
+            "删除许愿人 <人物ID>",
             "================================",
             "管理员指令：",
-            "系统设置 <功能> <参数>",
-            "清理后宫 <QQ号>",
-            "强制离婚 <角色ID>",
+            "抽人设置 <功能> <参数>",
+            "清理老婆 <QQ号>",
+            "强制解除 <人物ID>",
             "================================",
             "群主/超管指令：",
-            "刷新 <QQ号>",
-            "终极轮回"
+            "人刷新 <QQ号>",
+            "人脉轮回 确认"
         ]
         yield event.chain_result([Comp.Plain("\n".join(menu_lines))])
         return
     
-    @filter.command("抽卡", alias={"ck"})
+    @filter.command("抽人", alias={"cr"})
     @filter.platform_adapter_type(PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def handle_draw(self, event: AstrMessageEvent):
-        '''抽卡！给结果贴表情来收集'''
+        '''从现实人物池抽人，给结果贴表情结缘'''
         event.call_llm = True
         user_id = event.get_sender_id()
         gid = event.get_group_id() or "global"
@@ -183,7 +213,17 @@ class CCB_Plugin(Star):
             config = await self.get_group_cfg(gid)
             limit = config.get("draw_hourly_limit", self.draw_hourly_limit_default)
             now_tm = time.localtime(now_ts)
-            bucket = f"{now_tm.tm_year}-{now_tm.tm_yday}-{now_tm.tm_hour}"
+            allowed, deny_msg = self._draw_time_allowed(now_tm, config)
+            if not allowed and deny_msg:
+                yield event.chain_result([Comp.At(qq=user_id), Comp.Plain(f"\u200b\n{deny_msg}")])
+                return
+
+            period_min = int(
+                config.get("draw_quota_period_minutes", self.draw_quota_period_default)
+                or self.draw_quota_period_default
+            )
+            period_min = max(1, min(1440, period_min))
+            bucket_id = int(now_ts // (period_min * 60))
             record_bucket, record_count = await self.get_kv_data(key, (None, 0))
             cooldown = config.get("draw_cooldown", 0)
 
@@ -193,19 +233,19 @@ class CCB_Plugin(Star):
                 if (now_ts - last_draw_ts) < cooldown:
                     return
 
-            if record_bucket != bucket:
+            if isinstance(record_bucket, str) or record_bucket != bucket_id:
                 count = 0
             else:
                 count = record_count
-                if count >= limit:
-                    if count == limit:
-                        chain = [
-                            Comp.At(qq=user_id),
-                            Comp.Plain("\u200b\n⚠本小时已达上限⚠")
-                        ]
-                        yield event.chain_result(chain)
-                        await self.put_kv_data(key, (bucket, count + 1))
-                    return
+            if count >= limit:
+                if count == limit:
+                    chain = [
+                        Comp.At(qq=user_id),
+                        Comp.Plain(f"\u200b\n⚠本{period_min}分钟内已达抽人上限⚠")
+                    ]
+                    yield event.chain_result(chain)
+                    await self.put_kv_data(key, (bucket_id, count + 1))
+                return
 
             next_count = count + 1
             remaining = limit - next_count
@@ -216,9 +256,9 @@ class CCB_Plugin(Star):
             else:
                 character = self.char_manager.get_random_character(limit=config.get('draw_scope', None))
             if not character:
-                yield event.plain_result("卡池数据未加载")
+                yield event.plain_result("人物池数据未加载")
                 return
-            name = character.get("name", "未知角色")
+            name = character.get("name", "未知人物")
             char_id = character.get("id")
             images = character.get("image") or []
             custom_paths = await self.get_kv_data(f"{gid}:{char_id}:custom_images", []) if char_id is not None else []
@@ -242,26 +282,26 @@ class CCB_Plugin(Star):
             if wished_by and (allow_ntr or not married_to):
                 for wisher in wished_by:
                     cq_message.append({"type": "at", "data": {"qq": wisher}})
-                cq_message.append({"type": "text", "data": {"text": f" 已许愿\n{name}"}})
+                cq_message.append({"type": "text", "data": {"text": f" 已许愿人\n{name}"}})
             else:
                 cq_message.append({"type": "text", "data": {"text": f"{name}"}})
             if married_to:
                 cq_message.append({"type": "text", "data": {"text": "\u200b\n❤已与"}})
                 cq_message.append({"type": "at", "data": {"qq": married_to}})
-                cq_message.append({"type": "text", "data": {"text": "结婚，勿扰❤"}})
+                cq_message.append({"type": "text", "data": {"text": "结缘，勿扰❤"}})
             if image_url:
                 cq_message.append({"type": "image", "data": {"file": image_url}})
             
             if remaining == limit-1 and not married_to:
-                cq_message.append({"type": "text", "data": {"text": "💡回复任意表情和TA结婚"}})
+                cq_message.append({"type": "text", "data": {"text": "💡回复任意表情与TA结缘"}})
             if remaining <= 0:
-                cq_message.append({"type": "text", "data": {"text": "⚠本小时已达上限⚠"}})
+                cq_message.append({"type": "text", "data": {"text": f"⚠本{period_min}分钟内已达抽人上限⚠"}})
 
             try:
                 # 使用NapCat的API获取消息ID
                 resp = await event.bot.api.call_action("send_group_msg", group_id=event.get_group_id(), message=cq_message)
                 msg_id = resp.get("message_id") if isinstance(resp, dict) else None
-                await self.put_kv_data(key, (bucket, next_count))
+                await self.put_kv_data(key, (bucket_id, next_count))
                 await self.put_kv_data(f"{gid}:last_draw", now_ts)
                 if msg_id is not None and (allow_ntr or not married_to):
                     # Maintain a small index; delete expired records
@@ -300,7 +340,7 @@ class CCB_Plugin(Star):
                 logger.error({"stage": "draw_send_error_bot", "error": repr(e)})
 
     async def handle_claim(self, event: AstrMessageEvent, msg_id: str | int | None = None):
-        '''结婚逻辑，给结果贴表情来收集。msg_id 可选，不传则从 event 取（表情触发时）；传则用做回复结婚时的抽卡消息 id。'''
+        '''结缘逻辑：给抽人结果贴表情收集。msg_id 可选（表情触发或回复结缘指令）。'''
         event.call_llm = True
         gid = event.get_group_id() or "global"
         user_id = event.get_sender_id()
@@ -336,7 +376,7 @@ class CCB_Plugin(Star):
                 wait_min = max(1, (wait_sec + 59) // 60)
                 yield event.chain_result([
                     Comp.At(qq=str(user_id)),
-                    Comp.Plain(f"结婚冷却中，剩余{wait_min}分钟。")
+                    Comp.Plain(f"结缘冷却中，剩余{wait_min}分钟。")
                 ])
                 await self.put_kv_data(f"{gid}:draw_msg:{msg_id}", draw_msg)
                 return
@@ -348,7 +388,7 @@ class CCB_Plugin(Star):
             if len(marry_list) >= harem_max:
                 yield event.chain_result([
                     Comp.At(qq=user_id),
-                    Comp.Plain(f" 你的后宫已满{harem_max}，无法再结婚。")
+                    Comp.Plain(f" 你的老婆名额已满（{harem_max}），无法再结缘。")
                 ])
                 await self.put_kv_data(f"{gid}:draw_msg:{msg_id}", draw_msg)
                 return
@@ -359,7 +399,7 @@ class CCB_Plugin(Star):
                     if random.random() < 0.7:
                         yield event.chain_result([
                             Comp.At(qq=user_id),
-                            Comp.Plain("\u200b\n失败了！该角色是对方的最爱")
+                            Comp.Plain("\u200b\n失败了！该人物是对方的置顶老婆")
                         ])
                         return
                     else:
@@ -410,10 +450,10 @@ class CCB_Plugin(Star):
                     Comp.Plain(f" 的{title}了！🎉")
                 ])
 
-    @filter.command("结婚")
+    @filter.command("结缘")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def handle_marry(self, event: AstrMessageEvent):
-        '''收集角色（回复抽卡消息时等同于贴表情结婚）'''
+        '''收集人物（回复抽人结果时等同于贴表情结缘）'''
         event.call_llm = True
         replied_msg_id = None
         for part in (event.message_obj.message or []):
@@ -429,10 +469,10 @@ class CCB_Plugin(Star):
         async for res in self.handle_claim(event, msg_id=replied_msg_id):
             yield res
 
-    @filter.command("我的后宫")
+    @filter.command("我的老婆")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def handle_harem(self, event: AstrMessageEvent, page: int = 0):
-        '''显示收集的人物列表'''
+        '''显示已结缘的现实人物列表（老婆团）'''
         event.call_llm = True
         gid = event.get_group_id() or "global"
         uid = str(event.get_sender_id())
@@ -444,7 +484,7 @@ class CCB_Plugin(Star):
                 yield event.chain_result([
                     Comp.Reply(id=event.message_obj.message_id),
                     Comp.At(qq=uid),
-                    Comp.Plain("，你的后宫空空如也。")
+                    Comp.Plain("，你的老婆列表空空如也。")
                 ])
                 harem_heats_key = f"{gid}_harem_heats"
                 harem_heats = await self.get_kv_data(harem_heats_key, {}) or {}
@@ -488,7 +528,7 @@ class CCB_Plugin(Star):
             if page == 0:
                 sender_name = event.get_sender_name() or event.get_sender_id()
                 header_parts = [
-                    Comp.Plain(f"{sender_name}的后宫\n总人气: {total_heat}")
+                    Comp.Plain(f"{sender_name}的老婆团\n总人气: {total_heat}")
                 ]
                 if fav and str(fav) in marry_list:
                     fav_char = self.char_manager.get_character_by_id(fav)
@@ -500,7 +540,7 @@ class CCB_Plugin(Star):
                 node_list = [
                     Comp.Node(
                         uin=event.get_self_id(),
-                        name=f"{sender_name}的后宫",
+                        name=f"{sender_name}的老婆团",
                         content=header_parts
                     )
                 ]
@@ -509,7 +549,7 @@ class CCB_Plugin(Star):
                     node_list.append(
                         Comp.Node(
                             uin=event.get_self_id(),
-                            name=f"{sender_name}的后宫",
+                            name=f"{sender_name}的老婆团",
                             content=[Comp.Plain("\n".join(chunk))]
                         )
                     )
@@ -521,7 +561,7 @@ class CCB_Plugin(Star):
                     node_list.append(
                         Comp.Node(
                             uin=event.get_self_id(),
-                            name=f"{sender_name}的后宫",
+                            name=f"{sender_name}的老婆团",
                             content=[Comp.Plain("\n".join(bond_lines))]
                         )
                     )
@@ -536,7 +576,7 @@ class CCB_Plugin(Star):
                 page = total_pages
             start_idx = (page - 1) * per_page
             end_idx = start_idx + per_page
-            lines.append(f"阵容总人气: {total_heat}")
+            lines.append(f"老婆团总人气: {total_heat}")
             lines.extend(entries[start_idx:end_idx])
             lines.append(f"(第{page}/{total_pages}页)")
             chain = [Comp.Reply(id=event.message_obj.message_id)]
@@ -550,15 +590,15 @@ class CCB_Plugin(Star):
             chain.append(Comp.Plain("\n".join(lines)))
             yield event.chain_result(chain)
 
-    @filter.command("离婚")
+    @filter.command("解除婚姻关系")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def handle_divorce(self, event: AstrMessageEvent, cid: str | int | None = None):
-        '''移除自己与指定角色的婚姻'''
+        '''解除与指定人物的婚姻关系（结缘）'''
         event.call_llm = True
         gid = event.get_group_id() or "global"
         user_id = event.get_sender_id()
         if cid is None or not str(cid).strip().isdigit():
-            yield event.plain_result("用法：离婚 <角色ID>")
+            yield event.plain_result("用法：解除婚姻关系 <人物ID>")
             return
         cid = int(str(cid).strip())
         lock = self._get_group_lock(gid)
@@ -569,7 +609,7 @@ class CCB_Plugin(Star):
             if str(cid) not in marry_list:
                 yield event.chain_result([
                     Comp.Reply(id=cmd_msg_id),
-                    Comp.Plain(f"结了吗你就离？"),
+                    Comp.Plain(f"结缘了吗你就解除？"),
                 ])
                 return
 
@@ -586,19 +626,19 @@ class CCB_Plugin(Star):
             yield event.chain_result([
                 Comp.Reply(id=cmd_msg_id),
                 Comp.At(qq=event.get_sender_id()),
-                Comp.Plain(f"已与 {cname or cid} 离婚。"),
+                Comp.Plain(f"已与 {cname or cid} 解除婚姻关系。"),
             ])
 
-    @filter.command("交换")
+    @filter.command("换老婆")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def handle_exchange(self, event: AstrMessageEvent, my_cid: str | int | None = None, other_cid: str | int | None = None):
-        '''向其他用户发起交换请求'''
+        '''向其他用户发起换老婆（互换已结缘人物）请求'''
         event.call_llm = True
         gid = event.get_group_id() or "global"
         user_id = event.get_sender_id()
         user_set = await self.get_user_list(gid)
         if my_cid is None or other_cid is None or not str(my_cid).strip().isdigit() or not str(other_cid).strip().isdigit():
-            yield event.plain_result("用法：交换 <我的角色ID> <对方角色ID>")
+            yield event.plain_result("用法：换老婆 <我的人物ID> <对方人物ID>")
             return
         my_cid = int(str(my_cid).strip())
         other_cid = int(str(other_cid).strip())
@@ -607,17 +647,17 @@ class CCB_Plugin(Star):
         my_claim_key = f"{gid}:{my_cid}:married_to"
         my_uid = await self.get_kv_data(my_claim_key, None)
         if not my_uid or str(my_uid) != str(user_id):
-            yield event.plain_result("你并未与该角色结婚，无法交换。")
+            yield event.plain_result("你并未与该人物结缘，无法换老婆。")
             return
 
         other_claim_key = f"{gid}:{other_cid}:married_to"
         other_uid = await self.get_kv_data(other_claim_key, None)
         if not other_uid or str(other_uid) == str(user_id):
-            yield event.plain_result("对方角色未婚，无法交换。")
+            yield event.plain_result("对方人物未结缘，无法换老婆。")
             return
 
         if str(other_uid) not in user_set:
-            yield event.plain_result("对方角色已不在本群，无法交换。")
+            yield event.plain_result("对方已不在本群，无法换老婆。")
             return
 
         # Prefer existing claim data; avoid loading full character pool
@@ -627,7 +667,7 @@ class CCB_Plugin(Star):
         cq_message = [
             {"type": "reply", "data": {"id": str(event.message_obj.message_id)}},
             {"type": "at", "data": {"qq": user_id}},
-            {"type": "text", "data": {"text": f"想用 {my_cname} 向你交换 {other_cname}。\n"}},
+            {"type": "text", "data": {"text": f"想用 {my_cname} 与你换老婆（换 {other_cname}）。\n"}},
             {"type": "at", "data": {"qq": other_uid}},
             {"type": "text", "data": {"text": "若同意，请给此条消息贴表情。"}},
         ]
@@ -667,7 +707,7 @@ class CCB_Plugin(Star):
                 )
         except Exception as e:
             logger.error({"stage": "exchange_prompt_send_error", "error": repr(e)})
-            yield event.plain_result("发送交换请求失败，请稍后再试。")
+            yield event.plain_result("发送换老婆请求失败，请稍后再试。")
             return
 
     async def process_swap(self, event: AstrMessageEvent, req: dict, msg_id):
@@ -691,10 +731,10 @@ class CCB_Plugin(Star):
 
             # Validate ownership
             if not (to_marrried_to and str(to_marrried_to) == to_uid):
-                yield event.plain_result("交换失败：对方已不再拥有该角色。")
+                yield event.plain_result("换老婆失败：对方已不再拥有该人物。")
                 return
             if not (from_marrried_to and str(from_marrried_to) == from_uid):
-                yield event.plain_result("交换失败：你已不再拥有该角色。")
+                yield event.plain_result("换老婆失败：你已不再拥有该人物。")
                 return
 
             from_fav = await self.get_kv_data(f"{gid}:{from_uid}:fav", None)
@@ -711,7 +751,7 @@ class CCB_Plugin(Star):
 
             if from_cid not in from_list or to_cid not in to_list:
                 # logger.info({"stage": "exchange_fail_missing_role", "msg_id": msg_id})
-                yield event.plain_result("交换失败：有人没有对应角色。")
+                yield event.plain_result("换老婆失败：有人没有对应人物。")
                 return
 
             from_list = [m for m in from_list if m != from_cid]
@@ -739,60 +779,60 @@ class CCB_Plugin(Star):
                 Comp.At(qq=from_uid),
                 Comp.Plain(" 与 "),
                 Comp.At(qq=to_uid),
-                Comp.Plain(f" 已完成交换：{from_cname} ↔ {to_cname}"),
+                Comp.Plain(f" 已完成换老婆：{from_cname} ↔ {to_cname}"),
             ])
 
-    @filter.command("最爱")
+    @filter.command("置顶老婆")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def handle_favorite(self, event: AstrMessageEvent, cid: str | int | None = None):
-        '''将指定角色设为最爱'''
+        '''将指定人物设为置顶老婆（「清理老婆」时保留）'''
         event.call_llm = True
         gid = event.get_group_id() or "global"
         user_id = str(event.get_sender_id())
         if cid is None or not str(cid).strip().isdigit():
-            yield event.plain_result("用法：最爱 <角色ID>")
+            yield event.plain_result("用法：置顶老婆 <人物ID>")
             return
         cid = str(cid).strip()
         marry_list_key = f"{gid}:{user_id}:partners"
         marry_list = await self.get_kv_data(marry_list_key, [])
         target = next((m for m in marry_list if str(m) == str(cid)), None)
         if not target:
-            yield event.plain_result("你尚未与该角色结婚！")
+            yield event.plain_result("你尚未与该人物结缘！")
             return
         cname = self.char_manager.get_character_by_id(cid).get("name") or ""
         await self.put_kv_data(f"{gid}:{user_id}:fav", cid)
         msg_chain = [
             Comp.Plain("已将 "),
             Comp.Plain(cname or str(cid)),
-            Comp.Plain(" 设为你的最爱。"),
+            Comp.Plain(" 设为你的置顶老婆。"),
         ]
         cmd_msg_id = event.message_obj.message_id
         if cmd_msg_id is not None:
             msg_chain.insert(0, Comp.Reply(id=str(cmd_msg_id)))
         yield event.chain_result(msg_chain)
 
-    @filter.command("许愿")
+    @filter.command("许愿人")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def handle_wish(self, event: AstrMessageEvent, cid: str | int | None = None):
-        '''许愿指定角色，稍稍增加概率'''
+        '''许愿人：将指定人物加入愿望单人，略微增加抽到概率'''
         event.call_llm = True
         gid = event.get_group_id() or "global"
         user_id = str(event.get_sender_id())
         config = await self.get_group_cfg(gid)
         if cid is None or not str(cid).strip().isdigit():
-            yield event.plain_result("用法：许愿 <角色ID>")
+            yield event.plain_result("用法：许愿人 <人物ID>")
             return
         cid = str(cid).strip()
         char = self.char_manager.get_character_by_id(cid)
         if not char:
-            yield event.plain_result(f"未找到ID为 {cid} 的角色")
+            yield event.plain_result(f"未找到ID为 {cid} 的人物")
             return
         wish_list_key = f"{gid}:{user_id}:wish_list"
         wish_list = await self.get_kv_data(wish_list_key, [])
         if len(wish_list) >= config.get("harem_max_size", self.harem_max_size_default):
             yield event.chain_result([
                 Comp.Reply(id=str(event.message_obj.message_id)),
-                Comp.Plain(f"愿望单已满"),
+                Comp.Plain(f"愿望单人已满"),
             ])
             return
         if cid not in wish_list:
@@ -805,13 +845,13 @@ class CCB_Plugin(Star):
             await self.put_kv_data(wished_by_key, wished_by)
         yield event.chain_result([
             Comp.Reply(id=str(event.message_obj.message_id)),
-            Comp.Plain(f"已许愿 {char.get('name')}"),
+            Comp.Plain(f"已许愿人 {char.get('name')}"),
         ])
 
-    @filter.command("愿望单")
+    @filter.command("愿望单人")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def handle_wish_list(self, event: AstrMessageEvent):
-        '''查看愿望单'''
+        '''查看愿望单人列表'''
         event.call_llm = True
         gid = event.get_group_id() or "global"
         user_id = str(event.get_sender_id())
@@ -821,7 +861,7 @@ class CCB_Plugin(Star):
             yield event.chain_result([
                 Comp.Reply(id=str(event.message_obj.message_id)),
                 Comp.At(qq=user_id),
-                Comp.Plain("你的愿望单为空"),
+                Comp.Plain("你的愿望单人列表为空"),
             ])
             return
         lines = []
@@ -842,15 +882,15 @@ class CCB_Plugin(Star):
             Comp.Plain("\n".join(lines)),
         ])
 
-    @filter.command("删除许愿")
+    @filter.command("删除许愿人")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def handle_wish_clear(self, event: AstrMessageEvent, cid: str | int | None = None):
-        '''从愿望单中删除指定角色'''
+        '''从愿望单人中删除指定人物'''
         event.call_llm = True
         gid = event.get_group_id() or "global"
         user_id = str(event.get_sender_id())
         if cid is None or not str(cid).strip().isdigit():
-            yield event.plain_result("用法：删除许愿 <角色ID>")
+            yield event.plain_result("用法：删除许愿人 <人物ID>")
             return
         cid = str(cid).strip()
         wish_list_key = f"{gid}:{user_id}:wish_list"
@@ -866,25 +906,25 @@ class CCB_Plugin(Star):
             await self.delete_kv_data(wished_by_key)
         yield event.chain_result([
             Comp.Reply(id=str(event.message_obj.message_id)),
-            Comp.Plain(f"已从愿望单移除"),
+            Comp.Plain(f"已从愿望单人移除"),
         ])
 
-    @filter.command("查询")
+    @filter.command("查人")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def handle_query(self, event: AstrMessageEvent, cid: str | int | None = None, iid: str | int | None = None):
-        '''查询指定角色的信息，可选图片序号 iid（1 到 图片数量）'''
+        '''查询指定现实人物信息，可选图片序号（1 到图片总数）'''
         gid = event.get_group_id() or "global"
         config = await self.get_group_cfg(gid)
         query_cooldown = config.get("query_cooldown", 0)
         if query_cooldown > 0:
             last_query_ts = await self.get_kv_data(f"{gid}:last_query", 0)
             if (time.time() - last_query_ts) < query_cooldown:
-                yield event.plain_result(f"查询冷却中，请等待{round(query_cooldown-(time.time()-last_query_ts),1)}秒后重试")
+                yield event.plain_result(f"查人冷却中，请等待{round(query_cooldown-(time.time()-last_query_ts),1)}秒后重试")
                 return
         await self.put_kv_data(f"{gid}:last_query", time.time())
         event.call_llm = True
         if cid is None:
-            yield event.plain_result("用法：查询 <角色ID> [图片序号]")
+            yield event.plain_result("用法：查人 <人物ID> [图片序号]")
             return
 
         cid_str = str(cid).strip()
@@ -892,7 +932,7 @@ class CCB_Plugin(Star):
             cid_int = int(cid_str)
             char = self.char_manager.get_character_by_id(cid_int)
             if not char:
-                yield event.plain_result(f"未找到ID为 {cid_int} 的角色")
+                yield event.plain_result(f"未找到ID为 {cid_int} 的人物")
                 return
             async for res in self.print_character_info(event, char, iid=iid):
                 yield res
@@ -903,7 +943,7 @@ class CCB_Plugin(Star):
                 return
 
     async def print_character_info(self, event: AstrMessageEvent, char: dict, iid: str | int | None = None):
-        '''打印角色信息，可选 iid 指定图片序号（1 到 len(pool)，无效则随机）'''
+        '''打印人物信息；iid 为图片序号（1 到 len(pool)，无效则随机）'''
         event.call_llm = True
         name = char.get("name", "")
         gender = char.get("gender")
@@ -954,21 +994,21 @@ class CCB_Plugin(Star):
                 name = user_info.get("card") or user_info.get("nickname") or married_to
             except:
                 name = f"({married_to})"
-            chain.append(Comp.Plain(f"\u200b\n❤已与 {name} 结婚❤"))
+            chain.append(Comp.Plain(f"\u200b\n❤已与 {name} 结缘❤"))
         yield event.chain_result(chain)
 
-    @filter.command("搜索")
+    @filter.command("搜人")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def handle_search(self, event: AstrMessageEvent, keyword: str | None = None):
-        '''搜索角色'''
+        '''按名称搜索现实人物'''
         event.call_llm = True
         if not keyword:
-            yield event.plain_result("用法：搜索 <角色名字/部分名字>")
+            yield event.plain_result("用法：搜人 <名称或部分名称>")
             return
         keyword = str(keyword).strip()
         matches = self.char_manager.search_characters_by_name(keyword)
         if not matches:
-            yield event.plain_result(f"未找到名称包含“{keyword}”的角色")
+            yield event.plain_result(f"未找到名称包含「{keyword}」的人物")
             return
         if len(matches) == 1:
             char = matches[0]
@@ -982,15 +1022,15 @@ class CCB_Plugin(Star):
             more = "" if len(matches) <= len(top) else f"\n..."
             yield event.plain_result("\n".join(lines) + more)
 
-    @filter.command("添加图片")
+    @filter.command("加照片")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def handle_add_image(self, event: AstrMessageEvent, cid: str | int | None = None):
-        '''添加图片'''
+        '''为已结缘人物添加自定义照片'''
         event.call_llm = True
         gid = event.get_group_id() or "global"
         user_id = str(event.get_sender_id())
         if cid is None or not str(cid).strip().isdigit():
-            yield event.plain_result("用法：添加图片 <角色ID>")
+            yield event.plain_result("用法：加照片 <人物ID>")
             return
         cid = int(str(cid).strip())
         lock = self._get_group_lock(gid)
@@ -998,7 +1038,7 @@ class CCB_Plugin(Star):
             partners_key = f"{gid}:{user_id}:partners"
             partners = await self.get_kv_data(partners_key, [])
             if str(cid) not in partners:
-                yield event.plain_result("角色不在后宫中")
+                yield event.plain_result("人物不在你的老婆列表中")
                 return
             # Parse image: either from Reply.chain (reply to image) or direct Image in message
             # Only accept Image type (ComponentType.Image), not Video or other segments
@@ -1045,21 +1085,21 @@ class CCB_Plugin(Star):
                 Comp.Plain(f"添加成功，当前自定义图片数量：{len(paths)}"),
             ])
 
-    @filter.command("清除图片")
+    @filter.command("清照片")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def handle_clear_image(self, event: AstrMessageEvent, cid: str | int | None = None):
-        '''清除指定角色的自定义图片'''
+        '''清除指定人物的自定义照片'''
         event.call_llm = True
         gid = event.get_group_id() or "global"
         user_id = str(event.get_sender_id())
         if cid is None or not str(cid).strip().isdigit():
-            yield event.plain_result("用法：清除图片 <角色ID>")
+            yield event.plain_result("用法：清照片 <人物ID>")
             return
         cid = int(str(cid).strip())
         married_to = await self.get_kv_data(f"{gid}:{cid}:married_to", None)
         group_role = await self.get_group_role(event)
         if str(married_to) != user_id and group_role not in ['admin', 'owner'] and str(event.get_sender_id()) not in self.super_admins:
-            yield event.plain_result("无权限：结婚用户或群管理员可清除该角色自定义图片")
+            yield event.plain_result("无权限：结缘用户或群管理员可清除该人物自定义照片")
             return
         custom_images_key = f"{gid}:{cid}:custom_images"
         paths = await self.get_kv_data(custom_images_key, [])
@@ -1075,13 +1115,13 @@ class CCB_Plugin(Star):
         await self.delete_kv_data(custom_images_key)
         yield event.chain_result([
             Comp.Reply(id=str(event.message_obj.message_id)),
-            Comp.Plain(f"已清除该角色的自定义图片"),
+            Comp.Plain(f"已清除该人物的自定义照片"),
         ])
 
-    @filter.command("强制离婚")
+    @filter.command("强制解除")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def handle_force_divorce(self, event: AstrMessageEvent, cid: str | int | None = None):
-        '''强制移除指定角色的婚姻，用于清除坏的数据（管理员专用）'''
+        '''强制解除指定人物的结缘（管理员专用）'''
         event.call_llm = True
         group_role = await self.get_group_role(event)
         if group_role not in ['admin', 'owner'] and str(event.get_sender_id()) not in self.super_admins:
@@ -1089,7 +1129,7 @@ class CCB_Plugin(Star):
             return
         gid = event.get_group_id() or "global"
         if cid is None or not str(cid).strip().isdigit():
-            yield event.plain_result("用法：强制离婚 <角色ID>")
+            yield event.plain_result("用法：强制解除 <人物ID>")
             return
         cid = int(str(cid).strip())
         await self.delete_kv_data(f"{gid}:{cid}:married_to")
@@ -1107,12 +1147,12 @@ class CCB_Plugin(Star):
                     await self.delete_kv_data(f"{gid}:{uid}:fav")
 
         cname = (self.char_manager.get_character_by_id(cid) or {}).get("name") or cid
-        yield event.plain_result(f"{cname} 已被强制解除婚约。")
+        yield event.plain_result(f"{cname} 已被强制解除结缘。")
 
-    @filter.command("清理后宫")
+    @filter.command("清理老婆")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def handle_clear_harem(self, event: AstrMessageEvent, uid: str | None = None):
-        '''清理指定用户的后宫，最爱会被保留（管理员专用）'''
+        '''清理指定用户的老婆团，置顶老婆会保留（管理员专用）'''
         event.call_llm = True
         group_role = await self.get_group_role(event)
         if group_role not in ['admin', 'owner'] and str(event.get_sender_id()) not in self.super_admins:
@@ -1122,7 +1162,7 @@ class CCB_Plugin(Star):
         lock = self._get_group_lock(gid)
         async with lock:
             if uid is None or not str(uid).strip().isdigit():
-                yield event.plain_result("用法：清理后宫 <QQ号>")
+                yield event.plain_result("用法：清理老婆 <QQ号>")
                 return
             uid = str(uid).strip()
             fav = await self.get_kv_data(f"{gid}:{uid}:fav", None)
@@ -1130,7 +1170,7 @@ class CCB_Plugin(Star):
             if not marry_list:
                 await self.delete_kv_data(f"{gid}:{uid}:fav")
                 await self.delete_kv_data(f"{gid}:{uid}:partners")
-                yield event.plain_result(f"{uid} 的后宫为空")
+                yield event.plain_result(f"{uid} 的老婆团为空")
                 return
             for cid in marry_list:
                 if str(cid) == str(fav):
@@ -1143,66 +1183,90 @@ class CCB_Plugin(Star):
                 await self.delete_kv_data(f"{gid}:{uid}:partners")
             else:
                 await self.put_kv_data(f"{gid}:{uid}:partners", [fav])
-            yield event.plain_result(f"已清理 {uid} 的后宫")
+            yield event.plain_result(f"已清理 {uid} 的老婆团")
 
-    @filter.command("系统设置")
+    @filter.command("抽人设置")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def handle_config(self, event: AstrMessageEvent, feature: str | None = None, value: str | None = None):
-        '''系统设置（管理员专用）'''
+        '''抽人设置：群内玩法参数（管理员专用）'''
         event.call_llm = True
         group_role = await self.get_group_role(event)
         if group_role not in ['admin', 'owner'] and str(event.get_sender_id()) not in self.super_admins:
             yield event.plain_result("无权限执行此命令。")
             return
-        config = await self.get_group_cfg(event.get_group_id())
+        gid = event.get_group_id() or "global"
+        config = await self.get_group_cfg(gid)
+        period_show = max(
+            1,
+            min(
+                1440,
+                int(
+                    config.get("draw_quota_period_minutes", self.draw_quota_period_default)
+                    or self.draw_quota_period_default
+                ),
+            ),
+        )
+        sh, eh = config.get("draw_time_start_hour"), config.get("draw_time_end_hour")
+        try:
+            if sh is not None and eh is not None:
+                slot_txt = f"{int(sh) % 24}点–{int(eh) % 24}点（左闭右开，跨天支持）"
+            else:
+                slot_txt = "未限制（全天）"
+        except (TypeError, ValueError):
+            slot_txt = "未限制（全天）"
         menu_lines = [
-            "用法：",
-            "系统设置 抽卡冷却 [0~60]",
-            f"———抽卡冷却（秒） | 当前值: {config.get('draw_cooldown', 0)}",
-            "系统设置 查询冷却 [0~60]",
-            f"———查询冷却（秒） | 当前值: {config.get('query_cooldown', 0)}",
-            "系统设置 抽卡次数 [1~10]",
-            f"———每小时抽卡次数 | 当前值: {config.get('draw_hourly_limit', self.draw_hourly_limit_default)}",
-            "系统设置 后宫上限 [5~50]",
-            f"———后宫人数上限 | 当前值: {config.get('harem_max_size', self.harem_max_size_default)}",
-            "系统设置 抽卡范围 [>5000]",
-            f"———抽卡热度范围 | 当前值: {config.get('draw_scope', '无')}",
-            "系统设置 牛头人 [0~100]",
-            f"———牛头人概率 | 当前值: {config.get('ntr_chance', 10)}"
+            "【抽人设置】用法示例：抽人设置 抽人冷却 5",
+            "抽人设置 抽人冷却 [0~60]（秒，全群两次抽人间隔）",
+            f"———当前值: {config.get('draw_cooldown', 0)}",
+            "抽人设置 查人冷却 [0~60]（秒）",
+            f"———当前值: {config.get('query_cooldown', 0)}",
+            "抽人设置 周期次数 [1~10]（每个配额周期内可抽人次数）",
+            f"———当前值: {config.get('draw_hourly_limit', self.draw_hourly_limit_default)}",
+            "抽人设置 配额周期 [1~1440]（分钟，与「周期次数」组成配额）",
+            f"———当前值: {period_show} 分钟",
+            "抽人设置 允许时段 起始-结束（0~23，如 9-22）或 关闭",
+            f"———{slot_txt}",
+            "抽人设置 老婆上限 [5~50]",
+            f"———当前值: {config.get('harem_max_size', self.harem_max_size_default)}",
+            "抽人设置 抽人范围 [>=5000]（按热度取前 N 名进入池）",
+            f"———当前值: {config.get('draw_scope', '无')}",
+            "抽人设置 牛头人 [0~100]",
+            f"———当前值: {config.get('ntr_chance', 10)}",
+            "（兼容旧子命令关键词：抽卡冷却/查询冷却/抽卡次数/后宫上限/人脉上限/抽卡范围）",
         ]
         if feature is None:
             yield event.chain_result([Comp.Plain("\n".join(menu_lines))])
             return
         feature = str(feature).strip()
-        if feature == "抽卡冷却":
+        if feature in ("抽人冷却", "抽卡冷却"):
             if value is None or not str(value).strip().isdigit():
-                yield event.plain_result("用法：抽卡冷却 [0~600](秒)")
+                yield event.plain_result("用法：抽人设置 抽人冷却 [0~60](秒)")
                 return
-            time = int(str(value).strip())
-            if time < 0:
-                time = 0
-            if time > 60:
+            cd_sec = int(str(value).strip())
+            if cd_sec < 0:
+                cd_sec = 0
+            if cd_sec > 60:
                 yield event.plain_result("时间不能超过60秒")
                 return
-            config["draw_cooldown"] = time
-            await self.put_group_cfg(event.get_group_id(), config)
-            yield event.plain_result(f"抽卡冷却已设置为{time}秒")
-        elif feature == "查询冷却":
+            config["draw_cooldown"] = cd_sec
+            await self.put_group_cfg(gid, config)
+            yield event.plain_result(f"抽人冷却已设置为{cd_sec}秒")
+        elif feature in ("查人冷却", "查询冷却"):
             if value is None or not str(value).strip().isdigit():
-                yield event.plain_result("用法：查询冷却 [0~60](秒)")
+                yield event.plain_result("用法：抽人设置 查人冷却 [0~60](秒)")
                 return
-            time = int(str(value).strip())
-            if time < 0:
-                time = 0
-            if time > 60:
+            cd_sec = int(str(value).strip())
+            if cd_sec < 0:
+                cd_sec = 0
+            if cd_sec > 60:
                 yield event.plain_result("时间不能超过60秒")
                 return
-            config["query_cooldown"] = time
-            await self.put_group_cfg(event.get_group_id(), config)
-            yield event.plain_result(f"查询冷却已设置为{time}秒")
-        elif feature == "抽卡次数":
+            config["query_cooldown"] = cd_sec
+            await self.put_group_cfg(gid, config)
+            yield event.plain_result(f"查人冷却已设置为{cd_sec}秒")
+        elif feature in ("周期次数", "抽卡次数"):
             if value is None or not str(value).strip().isdigit():
-                yield event.plain_result("用法：抽卡次数 [1~10]")
+                yield event.plain_result("用法：抽人设置 周期次数 [1~10]")
                 return
             count = int(str(value).strip())
             if count < 1:
@@ -1211,11 +1275,62 @@ class CCB_Plugin(Star):
                 yield event.plain_result("次数不能超过10次")
                 return
             config["draw_hourly_limit"] = count
-            await self.put_group_cfg(event.get_group_id(), config)
-            yield event.plain_result(f"每小时抽卡次数已设置为{count}次")
-        elif feature == "后宫上限":
+            await self.put_group_cfg(gid, config)
+            pm = max(
+                1,
+                min(
+                    1440,
+                    int(
+                        config.get("draw_quota_period_minutes", self.draw_quota_period_default)
+                        or self.draw_quota_period_default
+                    ),
+                ),
+            )
+            yield event.plain_result(f"每个配额周期（{pm} 分钟）内可抽人次数已设为 {count} 次")
+        elif feature == "配额周期":
             if value is None or not str(value).strip().isdigit():
-                yield event.plain_result("用法：后宫上限 [5~50]")
+                yield event.plain_result("用法：抽人设置 配额周期 [1~1440]（分钟）")
+                return
+            pm = int(str(value).strip())
+            pm = max(1, min(1440, pm))
+            config["draw_quota_period_minutes"] = pm
+            await self.put_group_cfg(gid, config)
+            yield event.plain_result(f"抽人配额周期已设置为 {pm} 分钟（周期内次数见「周期次数」）")
+        elif feature in ("允许时段", "抽人时段"):
+            if value is None:
+                yield event.plain_result("用法：抽人设置 允许时段 起始-结束（如 9-22）或 关闭")
+                return
+            vs = str(value).strip().lower()
+            if vs in ("关", "关闭", "none", "off"):
+                config.pop("draw_time_start_hour", None)
+                config.pop("draw_time_end_hour", None)
+                await self.put_group_cfg(gid, config)
+                yield event.plain_result("已关闭抽人时段限制（全天可抽）")
+            else:
+                raw = str(value).strip().replace("：", ":").replace("—", "-")
+                if "-" not in raw:
+                    yield event.plain_result("时段格式错误，示例：9-22 表示 9≤小时<22")
+                    return
+                parts = raw.split("-", 1)
+                if len(parts) != 2:
+                    yield event.plain_result("时段格式错误，示例：9-22")
+                    return
+                try:
+                    sh = int(parts[0].strip()) % 24
+                    eh = int(parts[1].strip()) % 24
+                except ValueError:
+                    yield event.plain_result("时段须为整数小时，示例：9-22")
+                    return
+                if sh == eh:
+                    yield event.plain_result("起始与结束不能相同（如需全天请用：抽人设置 允许时段 关闭）")
+                    return
+                config["draw_time_start_hour"] = sh
+                config["draw_time_end_hour"] = eh
+                await self.put_group_cfg(gid, config)
+                yield event.plain_result(f"允许抽人时段已设为 {sh}点–{eh}点（左闭右开）")
+        elif feature in ("老婆上限", "人脉上限", "后宫上限"):
+            if value is None or not str(value).strip().isdigit():
+                yield event.plain_result("用法：抽人设置 老婆上限 [5~50]")
                 return
             count = int(str(value).strip())
             if count < 5:
@@ -1223,63 +1338,63 @@ class CCB_Plugin(Star):
             if count > 50:
                 count = 50
             config["harem_max_size"] = count
-            await self.put_group_cfg(event.get_group_id(), config)
-            yield event.plain_result(f"后宫上限已设置为{count}")
-        elif feature == "抽卡范围":
+            await self.put_group_cfg(gid, config)
+            yield event.plain_result(f"老婆上限已设置为{count}")
+        elif feature in ("抽人范围", "抽卡范围"):
             if value is None or not str(value).strip().isdigit():
-                yield event.plain_result("用法：抽卡范围 [>5000]")
+                yield event.plain_result("用法：抽人设置 抽人范围 [>=5000]")
                 return
             scope = int(str(value).strip())
             if scope < 5000:
                 scope = 5000
             config["draw_scope"] = scope
-            await self.put_group_cfg(event.get_group_id(), config)
-            yield event.plain_result(f"抽卡范围已设置为热度前{scope}")
+            await self.put_group_cfg(gid, config)
+            yield event.plain_result(f"抽人范围已设置为热度前{scope}")
         elif feature == "牛头人":
             if value is None or not str(value).strip().isdigit():
-                yield event.plain_result("用法：牛头人 [0~100]")
+                yield event.plain_result("用法：抽人设置 牛头人 [0~100]")
                 return
-            value = int(str(value).strip())
-            if value < 0 or value > 100:
-                yield event.plain_result("用法：牛头人 [0~100]")
+            ntr_val = int(str(value).strip())
+            if ntr_val < 0 or ntr_val > 100:
+                yield event.plain_result("用法：抽人设置 牛头人 [0~100]")
                 return
-            config["ntr_chance"] = value
-            await self.put_group_cfg(event.get_group_id(), config)
-            yield event.plain_result(f"现在抽到别人对象有{value}%概率可牛")
+            config["ntr_chance"] = ntr_val
+            await self.put_group_cfg(gid, config)
+            yield event.plain_result(f"现在抽到他人已结缘对象时有{ntr_val}%概率可牛")
         else:
-            yield event.chain_result([Comp.Plain("\n".join(menu_lines))]) 
+            yield event.chain_result([Comp.Plain("\n".join(menu_lines))])
 
-    @filter.command("刷新")
+    @filter.command("人刷新")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def handle_refresh(self, event: AstrMessageEvent, user_id: str | None = None):
-        '''刷新指定用户的抽卡和结婚冷却（群主和超管专用）'''
+        '''重置指定用户的抽人配额与结缘冷却（群主和超管专用）'''
         event.call_llm = True
         group_role = await self.get_group_role(event)
         if group_role not in ['owner'] and str(event.get_sender_id()) not in self.super_admins:
             yield event.plain_result("无权限执行此命令。")
             return
         if user_id is None or not str(user_id).strip():
-            yield event.plain_result("用法：刷新 <QQ号>")
+            yield event.plain_result("用法：人刷新 <QQ号>")
             return
         user_id = str(user_id).strip()
         if not user_id:
-            yield event.plain_result("用法：刷新 <QQ号>")
+            yield event.plain_result("用法：人刷新 <QQ号>")
             return
         gid = event.get_group_id() or "global"
         await self.delete_kv_data(f"{gid}:{user_id}:draw_status")
         await self.delete_kv_data(f"{gid}:{user_id}:last_claim")
-        yield event.plain_result("次数已重置，结婚冷却已清除")
+        yield event.plain_result("抽人次数已重置，结缘冷却已清除")
 
-    @filter.command("群排行")
+    @filter.command("老婆排行")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def handle_group_rank(self, event: AstrMessageEvent):
-        '''显示群排名'''
+        '''显示本群老婆团总人气排名'''
         event.call_llm = True
         gid = event.get_group_id() or "global"
         harem_heats_key = f"{gid}_harem_heats"
         harem_heats = await self.get_kv_data(harem_heats_key, {}) or {}
         if not harem_heats:
-            yield event.plain_result("暂无排名数据")
+            yield event.plain_result("暂无老婆排行数据")
             return
         sorted_heats = sorted(harem_heats.items(), key=lambda x: x[1], reverse=True)[:10]
         rank_lines = []
@@ -1292,17 +1407,17 @@ class CCB_Plugin(Star):
             rank_lines.append(f"{i+1}. {name}：{heat}")
         yield event.plain_result("\n".join(rank_lines))
 
-    @filter.command("终极轮回")
+    @filter.command("人脉轮回")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def handle_ultimate_reset(self, event: AstrMessageEvent, confirm: str | None = None):
-        '''清除本群所有角色婚姻信息（除了最爱角色）（群主和超管专用）'''
+        '''清除本群结缘数据（置顶老婆保留）（群主和超管专用）'''
         event.call_llm = True
         group_role = await self.get_group_role(event)
         if group_role not in ['owner'] and str(event.get_sender_id()) not in self.super_admins:
             yield event.plain_result("无权限执行此命令。")
             return
         if str(confirm) != "确认":
-            yield event.plain_result("确定要进行终极轮回吗？此操作将清除本群所有角色婚姻信息（除了最爱角色）。\n如果确定要执行，请使用“终极轮回 确认”")
+            yield event.plain_result("确定要进行人脉轮回吗？将清除本群所有结缘（置顶老婆保留）。\n确认请发送：人脉轮回 确认")
             return
         gid = event.get_group_id() or "global"
         lock = self._get_group_lock(gid)
@@ -1328,7 +1443,7 @@ class CCB_Plugin(Star):
                     await self.delete_kv_data(f"{gid}:{uid}:partners")
                 else:
                     await self.put_kv_data(f"{gid}:{uid}:partners", [fav])
-            yield event.plain_result("已清除本群所有角色婚姻信息")
+            yield event.plain_result("已清除本群结缘数据（置顶老婆已保留）")
 
     async def terminate(self):
         """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""

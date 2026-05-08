@@ -36,7 +36,7 @@ class CharacterManager:
     def load_characters(self) -> list[dict]:
         """Load pre-sorted character pool from file once."""
         if self._characters is None:
-            data_path = Path(__file__).resolve().parent / "characters.json"
+            data_path = Path(__file__).resolve().parent / "现实人物.json"
             try:
                 with data_path.open("r", encoding="utf-8") as f:
                     self._characters = json.load(f)

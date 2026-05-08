@@ -7,11 +7,18 @@
       "default": []
     },
     "draw_hourly_limit": {
-      "description": "默认每小时抽卡次数",
+      "description": "默认每个配额周期内抽人次数（周期长度见群「抽人设置」配额周期，默认 60 分钟）",
       "type": "int",
       "hint": "建议不要太高",
       "obvious_hint": true,
       "default": 5
+    },
+    "draw_quota_period_minutes": {
+      "description": "新群默认抽人配额周期（分钟），群内可用「抽人设置 配额周期」覆盖",
+      "type": "int",
+      "hint": "1~1440，与周期次数共同决定频率",
+      "obvious_hint": true,
+      "default": 60
     },
     "claim_cooldown": {
       "description": "默认结婚冷却时间(秒)",
